@@ -1,9 +1,10 @@
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -50,22 +51,37 @@ def _mongo_history_to_gemini(history: list[dict]) -> list[dict]:
     return gemini_hist
 
 
+def send_email_async(booking_data: dict):
+    """Background task to send email without blocking response."""
+    send_email_to_samantha(booking_data)
+    logger.info(f"[EMAIL-ASYNC] Email sent for {booking_data.get('name')}")
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
+    req_start = time.time()
+    logger.info(f"[CHAT] Request started - session: {req.session_id}")
+    
     db = await get_db()
     collection = db["chat_history"]
 
-    # Fetch prior conversation for this session (last 20 turns)
+    # Fetch prior conversation for this session (last 5 turns for faster response - reduced from 10)
+    db_start = time.time()
     past_docs = (
         await collection.find({"session_id": req.session_id})
         .sort("timestamp", 1)
-        .to_list(length=20)
+        .to_list(length=5)
     )
+    db_time = time.time() - db_start
+    logger.info(f"[CHAT] Database fetch took {db_time:.2f}s (found {len(past_docs)} messages)")
 
     gemini_history = _mongo_history_to_gemini(past_docs)
 
-    # Get LLM response
+    # Get LLM response (now using OpenAI GPT-4)
+    gemini_start = time.time()
     bot_raw = await get_gemini_response(req.message, gemini_history)
+    gemini_time = time.time() - gemini_start
+    logger.info(f"[CHAT] OpenAI response received in {gemini_time:.2f}s")
 
     # Check for booking data
     booking_data = extract_booking_data(bot_raw)
@@ -81,9 +97,9 @@ async def chat(req: ChatRequest):
                 "timestamp": datetime.now(timezone.utc),
             }
         )
-        # Send email to Samantha
-        send_email_to_samantha(booking_data)
-        logger.info("Booking captured & email dispatched for %s", booking_data.get("name"))
+        # Send email in background (non-blocking)
+        background_tasks.add_task(send_email_async, booking_data)
+        logger.info(f"[CHAT] Email scheduled for {booking_data.get('name')}")
 
     # Strip the JSON tag before sending reply to patient
     clean_reply = strip_booking_tag(bot_raw)
@@ -97,6 +113,9 @@ async def chat(req: ChatRequest):
             "timestamp": datetime.now(timezone.utc),
         }
     )
+    
+    total_time = time.time() - req_start
+    logger.info(f"[CHAT] Total request time: {total_time:.2f}s")
 
     return ChatResponse(reply=clean_reply, booking_captured=booking_captured)
 
